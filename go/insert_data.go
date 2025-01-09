@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"sync"
 )
 
 // Config structure to hold configuration details
@@ -17,8 +18,28 @@ type Config struct {
 	CSVFile       string            `json:"csv_file"`
 	TableName     string            `json:"table_name"`
 	SQLStatement  string            `json:"sql_statement"`
+	NoOfWorkers   int               `json:"no_of_workers"`
 	ColumnMapping map[string]int    `json:"column_mapping"`
-	CustomMapping map[string]string `json:"custom_mapping"` // Updated to correct type
+	CustomMapping map[string]string `json:"custom_mapping"`
+}
+
+func (c *Config) GetNoOfWorkers() int {
+	println(c.NoOfWorkers)
+	if c.NoOfWorkers <= 0 {
+		return 5
+	} else {
+		return c.NoOfWorkers
+	}
+}
+
+func worker(db *sql.DB, records <-chan []interface{}, wg *sync.WaitGroup, sqlStatement string) {
+	defer wg.Done()
+	for values := range records {
+		_, err := db.Exec(sqlStatement, values...)
+		if err != nil {
+			log.Printf("Failed to insert record: %v", err)
+		}
+	}
 }
 
 func main() {
@@ -62,7 +83,18 @@ func main() {
 		log.Fatalf("Unable to read CSV file: %v", err)
 	}
 
-	// Loop through the records and insert them into the table
+	// Create channels and a wait group
+	recordChan := make(chan []interface{}, 100) // Buffer size for the channel
+	var wg sync.WaitGroup
+
+	// Start worker pool
+	numWorkers := config.GetNoOfWorkers()
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go worker(db, recordChan, &wg, config.SQLStatement)
+	}
+
+	// Loop through the records and send them to the workers
 	for i, record := range records {
 		values := make([]interface{}, len(config.ColumnMapping)+len(config.CustomMapping))
 
@@ -83,12 +115,13 @@ func main() {
 			index++
 		}
 
-		// Execute the insert statement
-		_, err := db.Exec(config.SQLStatement, values...)
-		if err != nil {
-			log.Printf("Failed to insert record on row %d: %v", i+1, err)
-		}
+		// Send values to the channel
+		recordChan <- values
 	}
+
+	// Close the channel and wait for all workers to finish
+	close(recordChan)
+	wg.Wait()
 
 	fmt.Println("Data insertion complete.")
 }
